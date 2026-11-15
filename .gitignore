@@ -1,0 +1,10 @@
+bin/
+obj/
+.godot/
+.vs/
+.idea/
+*.user
+build/
+TestResults/
+artifacts/
+dist/

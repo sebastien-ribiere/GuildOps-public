@@ -1,0 +1,430 @@
+using GuildOps.Core.Data;
+using GuildOps.Core.Domain;
+using GuildOps.Core.Randomness;
+
+namespace GuildOps.Core.Engine;
+
+/// <summary>
+/// Façade du moteur. Les commandes (Assign, Resolve, Reset) sont atomiques : un refus ne modifie rien.
+/// Les requêtes (Preview, propriétés) ne modifient jamais l'état et ne tirent jamais le hasard.
+/// </summary>
+public sealed class GameSession
+{
+    private readonly Func<long, ISeededRandom> _rngFactory;
+    private readonly ITraitEffects _traits;
+    private ISeededRandom _rng = null!;
+    private readonly List<Hero> _heroes = [];
+    private readonly List<QuestOffer> _offers = [];
+    private readonly List<Quest> _quests = [];
+    private readonly List<GameEvent> _events = [];
+    private readonly List<Complaint> _complaints = [];
+    private int _questCounter;
+    private int _complaintCounter;
+
+    private GameSession(GameData data, long seed, Func<long, ISeededRandom> rngFactory, ITraitEffects traits)
+    {
+        Data = data;
+        Seed = seed;
+        _rngFactory = rngFactory;
+        _traits = traits;
+        Guild = null!;
+    }
+
+    /// <param name="traits">Effets de traits ; par défaut le catalogue V0 (<see cref="NoTraitEffects"/> pour les désactiver).</param>
+    public static GameSession Start(GameData data, long seed, Func<long, ISeededRandom>? rngFactory = null, ITraitEffects? traits = null)
+    {
+        var session = new GameSession(data, seed, rngFactory ?? (s => new SeededRandom(s)), traits ?? TraitCatalog.Default);
+        session.Initialize();
+        return session;
+    }
+
+    public GameData Data { get; }
+    public long Seed { get; }
+    public Guild Guild { get; private set; }
+    public IReadOnlyList<Hero> Heroes => _heroes;
+    /// <summary>Historique complet des offres de toutes les journées (les anciennes ne sont jamais modifiées après expiration).</summary>
+    public IReadOnlyList<QuestOffer> Offers => _offers;
+    /// <summary>Tableau actif de la journée en cours (les offres remplacées par une régénération restent dans <see cref="Offers"/>).</summary>
+    public IReadOnlyList<QuestOffer> CurrentOffers => _offers.Where(o => o.Day == Guild.Day && o.State != OfferState.Expired).ToList();
+    public IReadOnlyList<Complaint> Complaints => _complaints;
+    public IReadOnlyList<Complaint> OpenComplaints => _complaints.Where(c => c.State == ComplaintState.Open).ToList();
+    public GameStatus Status { get; private set; }
+    /// <summary>Vrai une fois la régénération (unique par partie) consommée.</summary>
+    public bool RegenerationUsed { get; private set; }
+    public FinalReport? Report { get; private set; }
+    public IReadOnlyList<Quest> Quests => _quests;
+    public IReadOnlyList<GameEvent> Events => _events;
+    public string ReputationTierId => Data.Rules.TierFor(Guild.Reputation).Id;
+
+    /// <summary>Rejoue l'état initial depuis la même graine (R12) : mêmes héros, mêmes offres, même journal de départ.</summary>
+    public void Reset() => Initialize();
+
+    private void Initialize()
+    {
+        var rules = Data.Rules;
+        _rng = _rngFactory(Seed);
+        _heroes.Clear();
+        _offers.Clear();
+        _quests.Clear();
+        _events.Clear();
+        _questCounter = 0;
+        _complaintCounter = 0;
+        _complaints.Clear();
+        Status = GameStatus.InProgress;
+        RegenerationUsed = false;
+        Report = null;
+        _heroes.AddRange(Data.Heroes.Select(d => new Hero(d)));
+        Guild = new Guild(rules.InitialTreasuryCopper, rules.InitialReputation, rules.InitialDay);
+
+        Log(GameEventType.GameStarted, $"Nouvelle partie (graine {Seed}) : {_heroes.Count} aventuriers, {Money(Guild.TreasuryCopper)}, réputation {Guild.Reputation}.");
+        PublishOffers($"d{Guild.Day}");
+    }
+
+    private void PublishOffers(string idPrefix)
+    {
+        var templates = OfferGenerator.Generate(Data, Guild.Reputation, Guild.TreasuryCopper, _heroes, _rng).ToList();
+        // Garantie de redressement : une guilde en difficulté voit toujours l'offre de secours.
+        var cheapest = _heroes.Min(h => h.Definition.BaseCostCopper);
+        if ((Guild.Reputation < Data.Rules.RecoveryReputationThreshold || Guild.TreasuryCopper < cheapest)
+            && templates.All(t => t.Id != Data.Rules.RecoveryTemplateId))
+            templates[0] = Data.Templates.First(t => t.Id == Data.Rules.RecoveryTemplateId);
+        for (var i = 0; i < templates.Count; i++)
+            _offers.Add(new QuestOffer($"{idPrefix}-o{i + 1}", templates[i], Guild.Day));
+        Log(GameEventType.OffersPublished, $"Jour {Guild.Day} : {templates.Count} offres publiées (palier « {ReputationTierId} »).");
+    }
+
+    // Les offres affichées sont recalculées à chaque changement de réputation : l'aperçu reflète toujours le tableau courant.
+    public AssignmentCheck Preview(string offerId, string heroId)
+    {
+        if (Status == GameStatus.Finished) return Refuse(RefusalReason.GameFinished);
+        var offer = _offers.FirstOrDefault(o => o.Id == offerId);
+        if (offer is null) return Refuse(RefusalReason.UnknownOffer);
+        var hero = _heroes.FirstOrDefault(h => h.Id == heroId);
+        if (hero is null) return Refuse(RefusalReason.UnknownHero);
+
+        var reasons = new List<RefusalReason>();
+        if (offer.State != OfferState.Available) reasons.Add(RefusalReason.OfferNotAvailable);
+        if (Guild.MissionsAcceptedToday >= Data.Rules.MaxMissionsPerDay) reasons.Add(RefusalReason.DailyLimitReached);
+
+        var trait = _traits.For(hero.Definition);
+        var engagement = TraitMath.EngagementCost(Data.Rules, trait, hero, offer.Template);
+        var energyCost = TraitMath.EnergyCost(trait, hero, offer.Template);
+        reasons.AddRange(AssignmentRules.Evaluate(Data.Rules, hero, offer.Template, Guild.TreasuryCopper, engagement, energyCost));
+
+        // La probabilité n'a de sens que si le niveau est admissible (le bonus de niveau n'est jamais négatif).
+        ChanceBreakdown? chance = hero.Definition.Level >= offer.Template.MinLevel
+            ? SuccessChance.Compute(Data.Rules, offer.Template.Category, hero.Definition.Level, offer.Template.MinLevel,
+                TraitMath.ChancePp(trait, hero, offer.Template), hero.Energy, energyCost)
+            : null;
+
+        var notes = new List<string>();
+        if (trait is not null)
+            foreach (var m in trait.Modifiers.Where(m => m.Categories.Count == 0 || m.Categories.Contains(offer.Template.Category)))
+            {
+                var active = TraitMath.ConditionMet(m.Condition, hero, offer.Template.Category);
+                notes.Add($"{(active ? "Actif" : "Inactif")} : {TraitMath.Describe(m)}");
+            }
+
+        return new AssignmentCheck(reasons.Count == 0, reasons, engagement, chance,
+            energyCost, TraitMath.Reward(trait, hero, offer.Template), notes);
+    }
+
+    public Result<Quest> Assign(string offerId, string heroId)
+    {
+        var check = Preview(offerId, heroId);
+        if (!check.CanAssign) return Result<Quest>.Refused(check.Reasons);
+
+        var offer = _offers.First(o => o.Id == offerId);
+        var hero = _heroes.First(h => h.Id == heroId);
+
+        // Transaction : toutes les vérifications sont faites, les mutations suivantes ne peuvent plus échouer.
+        Guild.Debit(check.EngagementCostCopper);
+        var quest = new Quest($"q{++_questCounter}", offer, hero.Id, check.EngagementCostCopper);
+        offer.State = OfferState.Accepted;
+        hero.AssignedQuestId = quest.Id;
+        Guild.MissionsAcceptedToday++;
+        _quests.Add(quest);
+        Log(GameEventType.MissionAssigned,
+            $"{hero.Definition.Name} part pour « {offer.Template.Title} » (engagement : {Money(check.EngagementCostCopper)}).");
+        return Result<Quest>.Success(quest);
+    }
+
+    public Result<MissionOutcome> Resolve(string questId)
+    {
+        if (Status == GameStatus.Finished) return Result<MissionOutcome>.Refused([RefusalReason.GameFinished]);
+        var quest = _quests.FirstOrDefault(q => q.Id == questId);
+        if (quest is null) return Result<MissionOutcome>.Refused([RefusalReason.UnknownQuest]);
+        if (quest.State == QuestState.Failed) return Result<MissionOutcome>.Refused([RefusalReason.QuestNotAssigned]);
+        var settled = quest.State == QuestState.Succeeded;
+
+        var rules = Data.Rules;
+        var hero = _heroes.First(h => h.Id == quest.HeroId);
+        var template = quest.Template;
+        var trait = _traits.For(hero.Definition);
+        var energyCost = TraitMath.EnergyCost(trait, hero, template);
+        var chance = SuccessChance.Compute(rules, template.Category, hero.Definition.Level, template.MinLevel,
+            TraitMath.ChancePp(trait, hero, template), hero.Energy, energyCost);
+
+        var roll = settled ? 0 : _rng.NextInt(100);
+        var success = settled || roll < chance.Final;
+        var isCommunity = template.Category == QuestCategory.Corvee;
+
+        // Mutations : énergie débitée une fois, prime versée une fois et seulement en cas de succès.
+        if (!settled)
+        {
+            hero.Energy -= energyCost;
+            hero.AssignedQuestId = null;
+        }
+        var rewardDue = TraitMath.Reward(trait, hero, template);
+        quest.State = success ? QuestState.Succeeded : QuestState.Failed;
+        var reward = success ? rewardDue : 0;
+        if (!settled) hero.RecordMission(template.Category);
+        Guild.Credit(reward);
+        if (success && !settled) Guild.MissionsSucceeded++;
+
+        var delta = success
+            ? (isCommunity ? rules.Deltas.CommunitySuccess : rules.Deltas.RegularSuccess)
+            : (isCommunity ? rules.Deltas.CommunityFailure : rules.Deltas.RegularFailure);
+        var before = Guild.Reputation;
+        var after = Guild.ApplyReputation(delta, rules.ReputationMin, rules.ReputationMax);
+        var reason = $"{(success ? "Succès" : "Échec")} de « {template.Title} »";
+
+        Log(GameEventType.MissionResolved,
+            $"{hero.Definition.Name} {(success ? "réussit" : "échoue")} « {template.Title} » (tirage {roll} / chance {chance.Final} %) : " +
+            $"{(success ? $"prime {Money(reward)}" : "aucune prime")}, énergie -{energyCost}.");
+        Log(GameEventType.ReputationChanged, $"Réputation {before} → {after} ({delta:+#;-#;0}) : {reason}.");
+        if (settled)
+            return Result<MissionOutcome>.Success(new MissionOutcome(
+                quest.Id, hero.Id, success, roll, chance.Final, reward, energyCost, before, after, reason, null));
+
+        // Coordination d'équipe (trait de rituel).
+        var shared = TraitMath.TeamRecovery(trait);
+        if (shared > 0)
+        {
+            foreach (var other in _heroes.Where(h => h.Id != hero.Id)) other.Energy = Math.Min(rules.MaxEnergy, other.Energy + shared);
+            Log(GameEventType.EnergyRecovered, $"{hero.Definition.Name} coordonne l'équipe : chaque autre aventurier récupère jusqu'à {shared} points d'énergie.");
+        }
+
+        // Incident éventuel : mission résolue (prime, énergie, réputation) → dommage collatéral et sa réputation → ouverture du dossier.
+        IncidentReport? incident = null;
+        var resolvedToday = _quests.Count(q => q.State != QuestState.Assigned && q.Offer.Day == Guild.Day);
+        var context = new MissionContext(hero.Id, quest.Template, success, Guild.Reputation, Guild.TreasuryCopper, resolvedToday);
+        var storylet = StoryletSelector.Select(Data.Storylets, context, _rng, TraitMath.IncidentPp(trait, hero, template));
+        if (storylet is not null)
+        {
+            var repBefore = Guild.Reputation;
+            var repAfter = Guild.ApplyReputation(-4, rules.ReputationMin, rules.ReputationMax);
+            var complaint = new Complaint($"c{++_complaintCounter}", quest.Id, storylet, Guild.Day, Guild.Day + Data.ComplaintExpiryDays);
+            _complaints.Add(complaint);
+            Log(GameEventType.ReputationChanged, $"Réputation {repBefore} → {repAfter} ({repAfter - repBefore:+#;-#;0}) : dommage collatéral ({storylet.Title}).");
+            Log(GameEventType.ComplaintOpened,
+                $"Réclamation {complaint.Id} — {storylet.Title} : {storylet.Text} (réparation : {Money(complaint.RepairCostCopper)} ; à traiter avant la fin du jour {complaint.ExpiresAfterDay}).");
+            incident = new IncidentReport(storylet.Id, storylet.Title, storylet.Text, complaint.Id, repAfter - repBefore);
+        }
+
+        return Result<MissionOutcome>.Success(new MissionOutcome(
+            quest.Id, hero.Id, success, roll, chance.Final, reward, energyCost, before, after, reason, incident));
+    }
+
+    /// <summary>
+    /// Clôt la journée. Refusée (sans mutation) si une mission engagée n'est pas résolue. Sinon : les offres non acceptées
+    /// expirent ; après la dernière journée, le bilan est établi ; sinon on passe au jour suivant (énergie récupérée,
+    /// compteur quotidien remis à zéro, nouvelles offres générées sur la réputation ACTUELLE).
+    /// </summary>
+    public Result<DayTransition> EndDay()
+    {
+        if (Status == GameStatus.Finished) return Result<DayTransition>.Refused([RefusalReason.GameFinished]);
+        if (_quests.Any(q => q.State == QuestState.Assigned)) return Result<DayTransition>.Refused([RefusalReason.PendingMissions]);
+
+        var rules = Data.Rules;
+        var ended = Guild.Day;
+        foreach (var complaint in _complaints.Where(c => c.State == ComplaintState.Open && ended >= c.ExpiresAfterDay))
+        {
+            var repBefore = Guild.Reputation;
+            var repAfter = Guild.ApplyReputation(-2, rules.ReputationMin, rules.ReputationMax);
+            complaint.State = ComplaintState.Expired;
+            complaint.Choice = ComplaintChoice.Deny;
+            Log(GameEventType.ComplaintExpired, $"Réclamation {complaint.Id} restée sans réponse : traitée comme un refus.");
+            Log(GameEventType.ReputationChanged, $"Réputation {repBefore} → {repAfter} ({repAfter - repBefore:+#;-#;0}) : réclamation {complaint.Id} expirée.");
+        }
+        foreach (var offer in _offers.Where(o => o.Day == ended && o.State == OfferState.Available)) offer.State = OfferState.Expired;
+        Log(GameEventType.DayEnded, $"Fin du jour {ended}.");
+
+        if (ended >= rules.Days)
+        {
+            Report = BuildReport();
+            Status = GameStatus.Finished;
+            Log(GameEventType.GameFinished, Report.Message);
+            return Result<DayTransition>.Success(new DayTransition(ended, null, [], Report));
+        }
+
+        Guild.Day = ended + 1;
+        Guild.MissionsAcceptedToday = 0;
+        foreach (var hero in _heroes) hero.Energy = Math.Min(rules.MaxEnergy, hero.Energy + rules.EnergyRegenerationAtDayStart);
+        Log(GameEventType.EnergyRecovered, $"Repos : chaque aventurier récupère jusqu'à {rules.EnergyRegenerationAtDayStart} points d'énergie (maximum {rules.MaxEnergy}).");
+        PublishOffers($"d{Guild.Day}");
+        return Result<DayTransition>.Success(new DayTransition(ended, Guild.Day, CurrentOffers, null));
+    }
+
+    /// <summary>Requête pure : raisons pour lesquelles la régénération est refusée (liste vide si elle est possible).</summary>
+    public IReadOnlyList<RefusalReason> RegenerationCheck()
+    {
+        if (Status == GameStatus.Finished) return [RefusalReason.GameFinished];
+        var reasons = new List<RefusalReason>();
+        if (!Data.Rules.RegenerateDayOnce) reasons.Add(RefusalReason.RegenerationDisabled);
+        else if (RegenerationUsed) reasons.Add(RefusalReason.RegenerationAlreadyUsed);
+        if (Guild.MissionsAcceptedToday > 0) reasons.Add(RefusalReason.MissionsAlreadyEngaged);
+        return reasons;
+    }
+
+    /// <summary>
+    /// Redemande le tableau de la journée en cours : une seule fois par partie, uniquement si aucune mission n'est engagée ce jour,
+    /// au prix de la réputation (rules.game.regenerateDayReputationCost). Les offres remplacées expirent (historique conservé) ;
+    /// le nouveau tirage prolonge le flux seedé et utilise la réputation APRÈS paiement du coût. Un second appel est refusé sans mutation.
+    /// </summary>
+    public Result<Regeneration> RegenerateOffers()
+    {
+        var reasons = RegenerationCheck();
+        if (reasons.Count > 0) return Result<Regeneration>.Refused(reasons);
+
+        var rules = Data.Rules;
+        RegenerationUsed = true;
+        foreach (var offer in _offers.Where(o => o.Day == Guild.Day && o.State == OfferState.Available)) offer.State = OfferState.Expired;
+
+        var before = Guild.Reputation;
+        var after = Guild.ApplyReputation(-rules.RegenerationReputationCost, rules.ReputationMin, rules.ReputationMax);
+        Log(GameEventType.OffersRegenerated, $"Le tableau du jour {Guild.Day} est renouvelé (coût : {rules.RegenerationReputationCost} points de réputation).");
+        Log(GameEventType.ReputationChanged, $"Réputation {before} → {after} ({after - before:+#;-#;0}) : renouvellement du tableau.");
+
+        var firstNew = _offers.Count;
+        PublishOffers($"d{Guild.Day}r");
+        return Result<Regeneration>.Success(new Regeneration(Guild.Day, _offers.Skip(firstNew).ToList(), before, after));
+    }
+
+    private FinalReport BuildReport()
+    {
+        // Les seuils du bilan sont exclusifs : il faut les dépasser strictement.
+        var v = Data.Rules.Victory;
+        var repOk = Guild.Reputation >= v.MinReputation;
+        var treasuryOk = Guild.TreasuryCopper >= v.MinTreasuryCopper;
+        var missionsOk = Guild.MissionsSucceeded >= v.MinSucceededMissions;
+        var success = repOk && treasuryOk && missionsOk;
+
+        var details = $"réputation {Guild.Reputation}/{v.MinReputation}, trésorerie {Money(Guild.TreasuryCopper)}/{Money(v.MinTreasuryCopper)}, " +
+                      $"missions réussies {Guild.MissionsSucceeded}/{v.MinSucceededMissions}";
+        var message = success
+            ? $"Redressement réussi ! Le conseil royal est satisfait ({details})."
+            : $"Bilan inachevé : le conseil royal vous accorde un sursis ({details}). Vous pouvez recommencer.";
+        var open = OpenComplaints.Count;
+        if (open > 0) message += $" Réclamations encore ouvertes : {open} (sans effet sur le bilan).";
+        return new FinalReport(success, Guild.Reputation, Guild.TreasuryCopper, Guild.MissionsSucceeded, repOk, treasuryOk, missionsOk, message, open);
+    }
+
+    private int DeltaFor(ComplaintChoice choice) => choice switch
+    {
+        ComplaintChoice.Repair => 3,
+        ComplaintChoice.Apologize => 1,
+        _ => -2,
+    };
+
+    private int TraitBonusFor(Complaint complaint, ComplaintChoice choice)
+    {
+        if (choice == ComplaintChoice.Deny) return 0;
+        var heroId = _quests.First(q => q.Id == complaint.QuestId).HeroId;
+        return TraitMath.ComplaintBonus(_traits.For(_heroes.First(h => h.Id == heroId).Definition));
+    }
+
+    /// <summary>Requête pure : points de réputation supplémentaires que le trait du héros concerné apporte à ce choix.</summary>
+    public int ComplaintTraitBonus(string complaintId, ComplaintChoice choice)
+    {
+        var complaint = _complaints.FirstOrDefault(c => c.Id == complaintId);
+        return complaint is null ? 0 : TraitBonusFor(complaint, choice);
+    }
+
+    /// <summary>Requête pure : raisons de refus d'un choix sur une réclamation (liste vide si faisable).</summary>
+    public IReadOnlyList<RefusalReason> ComplaintCheck(string complaintId, ComplaintChoice choice)
+    {
+        if (Status == GameStatus.Finished) return [RefusalReason.GameFinished];
+        var complaint = _complaints.FirstOrDefault(c => c.Id == complaintId);
+        if (complaint is null) return [RefusalReason.UnknownComplaint];
+        if (complaint.State != ComplaintState.Open) return [RefusalReason.ComplaintNotOpen];
+        if (choice == ComplaintChoice.Repair && Guild.TreasuryCopper < complaint.RepairCostCopper) return [RefusalReason.NotEnoughTreasury];
+        return [];
+    }
+
+    /// <summary>
+    /// Traite une réclamation, une seule fois. Une réclamation ne modifie jamais la réputation : seul le résultat des missions compte.
+    /// Ne requalifie jamais la mission ; une réparation impayable est refusée sans mutation (excuses et refus restent possibles).
+    /// </summary>
+    public Result<ComplaintOutcome> ResolveComplaint(string complaintId, ComplaintChoice choice)
+    {
+        var reasons = ComplaintCheck(complaintId, choice);
+        if (reasons.Count > 0) return Result<ComplaintOutcome>.Refused(reasons);
+
+        var rules = Data.Rules;
+        var complaint = _complaints.First(c => c.Id == complaintId);
+        var cost = choice == ComplaintChoice.Repair ? complaint.RepairCostCopper : 0;
+        Guild.Debit(cost);
+        var before = Guild.Reputation;
+        var bonus = TraitBonusFor(complaint, choice);
+        var after = Guild.ApplyReputation(DeltaFor(choice) + bonus, rules.ReputationMin, rules.ReputationMax);
+        complaint.State = ComplaintState.Resolved;
+        complaint.Choice = choice;
+
+        var label = choice switch
+        {
+            ComplaintChoice.Repair => complaint.Storylet.Labels.Repair,
+            ComplaintChoice.Apologize => complaint.Storylet.Labels.Apologize,
+            _ => complaint.Storylet.Labels.Deny,
+        };
+        var message = $"Réclamation {complaint.Id} close : {label} (coût {Money(cost)}{(bonus != 0 ? $", trait du héros {bonus:+#;-#} réputation" : "")}).";
+        Log(GameEventType.ComplaintResolved, message);
+        Log(GameEventType.ReputationChanged, $"Réputation {before} → {after} ({after - before:+#;-#;0}) : réclamation {complaint.Id}.");
+        return Result<ComplaintOutcome>.Success(new ComplaintOutcome(complaint.Id, choice, cost, before, after, message, bonus));
+    }
+
+    /// <summary>Requête pure : raisons de refus d'une préparation (liste vide si possible).</summary>
+    public IReadOnlyList<RefusalReason> PreparationCheck(string heroId, QuestCategory category)
+    {
+        if (Status == GameStatus.Finished) return [RefusalReason.GameFinished];
+        var hero = _heroes.FirstOrDefault(h => h.Id == heroId);
+        if (hero is null) return [RefusalReason.UnknownHero];
+        var preparation = _traits.For(hero.Definition)?.Preparation;
+        if (preparation is null) return [RefusalReason.NoPreparationTrait];
+        var reasons = new List<RefusalReason>();
+        if (!hero.IsFree) reasons.Add(RefusalReason.HeroBusy);
+        if (hero.IsPrepared(category)) reasons.Add(RefusalReason.AlreadyPrepared);
+        if (hero.Energy < preparation.EnergyCost) reasons.Add(RefusalReason.NotEnoughEnergy);
+        if (Guild.TreasuryCopper < preparation.CopperCost) reasons.Add(RefusalReason.NotEnoughTreasury);
+        return reasons;
+    }
+
+    /// <summary>Coût de préparation du héros (null s'il n'en a pas) : affichable avant de s'engager.</summary>
+    public TraitPreparation? PreparationCostFor(string heroId) =>
+        _heroes.FirstOrDefault(h => h.Id == heroId) is { } hero ? _traits.For(hero.Definition)?.Preparation : null;
+
+    /// <summary>
+    /// Investissement explicite (trait « observer puis automatiser ») : énergie et cuivres dépensés maintenant, bonus de chance
+    /// réutilisable sur toutes les missions de la catégorie. Ne compte pas comme une mission de la journée ; atomique.
+    /// </summary>
+    public Result<PreparationOutcome> Prepare(string heroId, QuestCategory category)
+    {
+        var reasons = PreparationCheck(heroId, category);
+        if (reasons.Count > 0) return Result<PreparationOutcome>.Refused(reasons);
+
+        var hero = _heroes.First(h => h.Id == heroId);
+        var cost = _traits.For(hero.Definition)!.Preparation!;
+        Guild.Debit(cost.CopperCost);
+        hero.Energy -= cost.EnergyCost;
+        hero.Prepare(category);
+        var message = $"{hero.Definition.Name} observe puis automatise la catégorie {category} (énergie -{cost.EnergyCost}, {Money(cost.CopperCost)}) : bonus réutilisable sur ses prochaines missions.";
+        Log(GameEventType.HeroPrepared, message);
+        return Result<PreparationOutcome>.Success(new PreparationOutcome(hero.Id, category, cost.EnergyCost, cost.CopperCost, message));
+    }
+
+    public string Money(int copper) => CurrencyFormat.Format(copper, 100);
+
+    private static AssignmentCheck Refuse(RefusalReason reason) => new(false, [reason], 0, null);
+
+    private void Log(GameEventType type, string message) => _events.Add(new GameEvent(_events.Count + 1, Guild.Day, type, message));
+}

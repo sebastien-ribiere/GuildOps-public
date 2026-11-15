@@ -1,0 +1,33 @@
+# Intégration continue — base minimale : restauration, compilation, tests, publication des résultats.
+# Équivalent local : tools/check.sh
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Restauration
+        run: dotnet restore GuildOps.sln
+      - name: Compilation
+        run: dotnet build GuildOps.sln --no-restore -c Release -warnaserror
+      - name: Tests
+        run: dotnet test GuildOps.sln --no-build -c Release --logger "trx;LogFileName=resultats.trx" --results-directory TestResults
+      - name: Résumé
+        if: always()
+        run: |
+          echo "### Résultats des tests" >> "$GITHUB_STEP_SUMMARY"
+          grep -ho 'total="[0-9]*" executed="[0-9]*" passed="[0-9]*" failed="[0-9]*"' TestResults/*.trx | head -1 >> "$GITHUB_STEP_SUMMARY" || echo "aucun résultat" >> "$GITHUB_STEP_SUMMARY"
+      - name: Publication des résultats
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resultats-tests
+          path: TestResults/*.trx

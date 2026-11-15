@@ -18,9 +18,17 @@ dotnet build src/GuildOps.Game    # compile le projet Godot (Godot.NET.Sdk 4.7.2
 godot --path src/GuildOps.Game --import   # première fois : importe les ressources
 godot --path src/GuildOps.Game    # lance le jeu (binaire Godot .NET)
 tools/check.sh                    # restauration + compilation + tests (équivalent d'une CI)
+tools/check.sh --offline          # idem, sans réseau, à partir du cache NuGet déjà rempli
+tools/bench.sh                    # benchmark (≈ 1 min)
 ```
-Licence du code : MIT (voir `LICENSE`). Préparation des postes et dépannage : voir `INSTALL-OFFLINE.md`.
 `GuildOps.Game` n'est volontairement pas dans `GuildOps.sln` : `dotnet test` ne dépend ainsi ni de Godot ni du paquet `Godot.NET.Sdk`.
+
+**Windows** : les commandes `dotnet` et `godot` sont identiques (PowerShell ou terminal de l'éditeur). Les scripts `tools/*.sh` demandent Git Bash ou WSL ; sans eux, lancez directement les commandes `dotnet` qu'ils contiennent (voir leur contenu, une dizaine de lignes).
+
+Préparation des postes et dépannage : voir `INSTALL-OFFLINE.md`. Licence du code : MIT (voir `LICENSE`).
+
+## Intégration continue
+`.github/workflows/ci.yml` restaure, compile, teste et publie les résultats de tests à chaque `push` et `pull request`. C'est une base minimale ; son équivalent local est `tools/check.sh`.
 
 ## Benchmark (test lent, ignoré par défaut)
 ```bash

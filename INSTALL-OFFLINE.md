@@ -11,6 +11,8 @@ Le jeu et les tests ne demandent aucune connexion. Seule la **préparation** du 
 
 ## Préparer le cache NuGet (avec Internet, une fois)
 ```bash
+tools/prepare-offline.sh
+# équivalent :
 dotnet restore GuildOps.sln
 dotnet restore src/GuildOps.Game/GuildOps.Game.csproj
 ```
@@ -20,6 +22,7 @@ Les paquets sont alors dans le cache utilisateur (`~/.nuget/packages`, `%USERPRO
 ```bash
 dotnet test --no-restore          # tests du moteur
 tools/check.sh --offline          # restauration locale + compilation + tests
+tools/bench.sh                    # benchmark, aucune connexion requise
 ```
 
 ## Lancer le jeu depuis les sources

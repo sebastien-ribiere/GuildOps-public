@@ -1,11 +1,4 @@
 ; Engine configuration file.
-; It's best edited using the editor UI and not directly,
-; since the parameters that go here are not all obvious.
-;
-; Format:
-;   [section] ; section goes between []
-;   param=value ; assign values to parameters
-
 config_version=5
 
 [application]
@@ -13,10 +6,10 @@ config_version=5
 config/name="GuildOps"
 config/description="Jeu de gestion de guilde fantasy, 100 % hors ligne et silencieux (Godot 4.7.2 .NET)."
 run/main_scene="res://Main.tscn"
-config/features=PackedStringArray("4.7", "C#")
-boot_splash/bg_color=Color(0.11, 0.08, 0.18, 1)
-boot_splash/show_image=false
+config/features=PackedStringArray("4.7", "C#", "Compatibility")
 config/icon="res://Assets/b5_3/branding/app_icon_256.png"
+boot_splash/show_image=false
+boot_splash/bg_color=Color(0.11, 0.08, 0.18, 1)
 
 [display]
 
@@ -34,5 +27,6 @@ project/assembly_name="GuildOps.Game"
 [rendering]
 
 textures/canvas_textures/default_texture_filter=0
+
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
